@@ -1,0 +1,5 @@
+*.pyc
+**/__cached__
+dist
+build
+*.egg-info
