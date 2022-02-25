@@ -2,6 +2,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 from enum import Enum
+import functools
 import logging
 import queue
 try:
@@ -13,7 +14,7 @@ except ModuleNotFoundError:
     import sqlite3 # type: ignore[no-redef]
 import threading
 import time
-from typing import Any, cast, Callable, Protocol, TypeVar
+from typing import Any, cast, Callable, ParamSpec, Protocol, TypeVar
 
 
 DATABASE_EXT = ".sqlite"
@@ -23,6 +24,7 @@ class DatabaseFunction(Protocol):
         ...
 
 
+P1 = ParamSpec("P1")
 T1 = TypeVar("T1")
 
 class LeakedSQLiteConnectionError(Exception):
@@ -298,15 +300,16 @@ class DatabaseContext:
             return True
         return False
 
-    def post_to_thread(self, func: Callable[..., T1], *args: Any, **kwargs: Any) \
+    def post_to_thread(self, func: Callable[P1, T1], *args: P1.args, **kwargs: P1.kwargs) \
             -> concurrent.futures.Future[T1]:
         return self._executor.submit(func, *args, **kwargs)
 
-    def run_in_thread(self, func: Callable[..., T1], *args: Any, **kwargs: Any) -> T1:
+    def run_in_thread(self, func: Callable[P1, T1], *args: P1.args, **kwargs: P1.kwargs) -> T1:
         future = self._executor.submit(func, *args, **kwargs)
         return cast(T1, future.result())
 
-    async def run_in_thread_async(self, func: Callable[..., T1], *args: Any) -> T1:
+    async def run_in_thread_async(self, func: Callable[P1, T1], *args: P1.args, \
+            **kwargs: P1.kwargs) -> T1:
         """
         Yield the current task until the function has executed in the SQLite write thread.
 
@@ -328,7 +331,7 @@ class DatabaseContext:
            db_context.run_in_thread_async(_writer)
         """
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(self._executor, func, *args)
+        return await loop.run_in_executor(self._executor, functools.partial(func, *args, **kwargs))
 
     @classmethod
     def shared_memory_uri(cls, unique_name: str) -> str:
@@ -351,7 +354,7 @@ class ExecutorItem(object):
 
         db.execute("BEGIN")
         try:
-            result = self._fn(db, *self._args, **self._kwargs)
+            result = self._fn(*self._args, **self._kwargs, db=db)
         except BaseException as exc:
             db.execute("ROLLBACK")
             self._future.set_exception(exc)
@@ -378,6 +381,10 @@ class SqliteExecutor(concurrent.futures.Executor):
 
     # NOTE(typing) mypy wants a perfect function signature match with Executor parent class
     def submit(self, fn, *args, **kwargs) -> concurrent.futures.Future:  # type: ignore
+        # The `db` argument is injected by the write dispatcher. Typing requires that the
+        # client application see this parameter in their write callback but they should have it
+        # last and optional so they never need to provide it and typing ignores it.
+        assert "db" not in kwargs
         with self._shutdown_lock:
             if self._shutdown:
                 raise RuntimeError('cannot schedule new futures after shutdown')
@@ -402,8 +409,7 @@ class SqliteExecutor(concurrent.futures.Executor):
                 self._shutdown_event.set()
 
 
-def replace_db_context_with_connection(func: Callable[..., T1]) \
-        -> Callable[..., T1]:
+def replace_db_context_with_connection(func: Callable[..., T1]) -> Callable[..., T1]:
     def wrapped_call(db_context: DatabaseContext, *args: Any, **kwargs: Any) -> T1:
         db = db_context.acquire_connection()
         try:

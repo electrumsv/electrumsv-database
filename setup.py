@@ -1,7 +1,7 @@
 from distutils.core import setup
 
 setup(name='electrumsv-database',
-      version='1.01',
+      version='1.5',
       description='Database support for use of SQLite (possibly other databases later).',
       author='Roger Taylor',
       author_email='roger.taylor.email@gmail.com',
@@ -12,5 +12,5 @@ setup(name='electrumsv-database',
       packages=['electrumsv_database'],
       package_data={ "electrumsv_database": ["py.typed"] },
       install_requires=[
-          'pysqlite3; platform_system!="Windows"'
+          'pysqlite3-binary; platform_system=="Linux"'
       ])
