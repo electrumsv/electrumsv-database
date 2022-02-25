@@ -32,14 +32,14 @@ writer thread to apply write queries sequentially through it's connection. This 
 as part of the `DatabaseContext` class, which creates the `SqliteWriteDispatcher` and
 `SqliteExecutor` for you.
 
-Creating a database context::
+Creating a database context:
 
 ```
 from electrumsv_database import DatabaseContext
 database_context = DatabaseContext(database_path)
 ```
 
-Block executing a writer callback as a transaction::
+Block executing a writer callback as a transaction:
 
 ```
 def write(a: int, s: str, db: Optional[sqlite3.Connection]=None) -> str:
@@ -51,7 +51,7 @@ s = database_context.run_in_thread(write, 5, "test")
 assert s == "whatever return value"
 ```
 
-Post a writer callback to be executed as a transaction::
+Post a writer callback to be executed as a transaction:
 
 ```
 def write(a: int, s: str, db: Optional[sqlite3.Connection]=None) -> str:
@@ -65,7 +65,7 @@ s = future.result()
 assert s == "whatever return value"
 ```
 
-Asynchronously block executing a writer callback as a transaction::
+Asynchronously block executing a writer callback as a transaction:
 
 ```
 def write(a: int, s: str, db: Optional[sqlite3.Connection]=None) -> str:
@@ -105,7 +105,7 @@ use to execute it's query. For this reason we use the following pattern, the wri
 adds an optional `db` keyword argument to the end of it's argument list, the write dispatcher
 provides that adding it as an extra argument over the one the application provided.
 
-The following pattern should be used::
+The following pattern should be used:
 
 ```
 def set_payment_channel_closed(channel_id: int, channel_state: ChannelState,
