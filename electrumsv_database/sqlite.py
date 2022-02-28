@@ -14,18 +14,21 @@ except ModuleNotFoundError:
     import sqlite3 # type: ignore[no-redef]
 import threading
 import time
-from typing import Any, cast, Callable, ParamSpec, Protocol, TypeVar
+from typing import Any, cast, Callable, Collection, Concatenate, Optional, ParamSpec, Protocol, \
+    Sequence, Type, TypeVar
 
 
 DATABASE_EXT = ".sqlite"
 
 class DatabaseFunction(Protocol):
-    def __call__(self, db: sqlite3.Connection, *args: Any, **kwargs: Any) -> Any:
+    def __call__(*args: Any, **kwargs: Any) -> Any:
         ...
 
 
 P1 = ParamSpec("P1")
 T1 = TypeVar("T1")
+T2 = TypeVar('T2')
+
 
 class LeakedSQLiteConnectionError(Exception):
     pass
@@ -99,7 +102,7 @@ class SqliteWriteDispatcher:
     Completion notifications are done in a thread so as to not block the write dispatcher.
     """
 
-    def __init__(self, db_context: DatabaseContext) -> None:
+    def __init__(self, db_context: DatabaseContext, write_warn_ms: int=0) -> None:
         self._db_context = db_context
         self._logger = logging.getLogger("sqlite-writer")
 
@@ -110,6 +113,7 @@ class SqliteWriteDispatcher:
         self._allow_puts = True
         self._is_alive = True
         self._exit_when_empty = False
+        self._write_warn_ms = write_warn_ms
 
         self._writer_thread.start()
 
@@ -132,7 +136,8 @@ class SqliteWriteDispatcher:
             time_start = time.time()
             write_entry(self._db)
             time_ms = int((time.time() - time_start) * 1000)
-            self._logger.debug("Invoked write callback in %d ms", time_ms)
+            if time_ms > self._write_warn_ms:
+                self._logger.debug("Invoked write callback in %d ms", time_ms)
 
     def put(self, write_entry: 'ExecutorItem') -> None:
         # If the writer is closed, then it is expected the caller should have made sure that
@@ -173,7 +178,7 @@ class DatabaseContext:
     MEMORY_PATH = ":memory:"
     JOURNAL_MODE = JournalModes.WAL
 
-    def __init__(self, wallet_path: str) -> None:
+    def __init__(self, wallet_path: str, *, write_warn_ms: int=0) -> None:
         if not self.is_special_path(wallet_path) and not wallet_path.endswith(DATABASE_EXT):
             wallet_path += DATABASE_EXT
         self._db_path = wallet_path
@@ -191,7 +196,7 @@ class DatabaseContext:
         # the calling logic (see issue #432). We do this before starting the writer thread
         # rather than letting it happen in the decoupled writer thread.
         self.increase_connection_pool()
-        self._write_dispatcher = SqliteWriteDispatcher(self)
+        self._write_dispatcher = SqliteWriteDispatcher(self, write_warn_ms)
         self._executor = SqliteExecutor(self._write_dispatcher)
 
     def acquire_connection(self) -> sqlite3.Connection:
@@ -409,6 +414,12 @@ class SqliteExecutor(concurrent.futures.Executor):
                 self._shutdown_event.set()
 
 
+# It is currently not possible to implement the disabled typed version below because mypy does
+# not have support for PEP 612 yet. This results in the following errors:
+# 'error: The first argument to Callable must be a list of types or "..."  [misc]'
+# - https://github.com/python/mypy/issues/11833
+# - https://github.com/python/typeshed/issues/4827
+# TODO(typing) Mypy lacks PEP 612 support. When it supports it, delete this.
 def replace_db_context_with_connection(func: Callable[..., T1]) -> Callable[..., T1]:
     def wrapped_call(db_context: DatabaseContext, *args: Any, **kwargs: Any) -> T1:
         db = db_context.acquire_connection()
@@ -417,3 +428,167 @@ def replace_db_context_with_connection(func: Callable[..., T1]) -> Callable[...,
         finally:
             db_context.release_connection(db)
     return wrapped_call
+
+# TODO(typing) Mypy lacks PEP 612 support. When it supports it, uncomment this.
+# # This takes a function and a set of parameters prepended with a database context and replaces
+# # the database context with a database connection. It should propagate typing through the
+# # decorator.
+# def replace_db_context_with_connection(func: Callable[Concatenate[sqlite3.Connection, P1], T1]) \
+#         -> Callable[Concatenate[DatabaseContext, P1], T1]:
+#     def wrapped_call(db_context: DatabaseContext, *args: P1.args, **kwargs: P1.kwargs) -> T1:
+#         db = db_context.acquire_connection()
+#         try:
+#             return func(db, *args, **kwargs)
+#         finally:
+#             db_context.release_connection(db)
+#     return wrapped_call
+
+
+def read_rows_by_id(return_type: Type[T1], db: sqlite3.Connection, sql: str, params: Sequence[Any],
+        ids: Sequence[T2]) -> list[T1]:
+    """
+    Batch read rows as constrained by database limitations.
+    """
+    results: list[T1] = []
+    batch_size = SQLITE_MAX_VARS - len(params)
+    remaining_ids = ids
+    params = tuple(params)
+    while len(remaining_ids):
+        batch_ids = tuple(remaining_ids[:batch_size])
+        sql = sql.format(",".join("?" for k in batch_ids))
+        cursor = db.execute(sql, params + tuple(batch_ids))
+        rows = cursor.fetchall()
+        cursor.close()
+        # Skip copying/conversion for standard types.
+        if len(rows):
+            if return_type is bytes:
+                assert len(rows[0]) == 1 and type(rows[0][0]) is return_type
+                results.extend(row[0] for row in rows)
+            else:
+                results.extend(return_type(*row) for row in rows)
+        remaining_ids = remaining_ids[batch_size:]
+    return results
+
+
+def read_rows_by_ids(return_type: Type[T1], db: sqlite3.Connection, sql: str, sql_condition: str,
+        sql_values: list[Any], ids: Sequence[Collection[T2]]) -> list[T1]:
+    """
+    Read rows in batches as constrained by database limitations.
+    """
+    batch_size = min(SQLITE_MAX_VARS, SQLITE_EXPR_TREE_DEPTH) // 2 - len(sql_values)
+    results: list[T1] = []
+    remaining_ids = ids
+    while len(remaining_ids):
+        batch = remaining_ids[:batch_size]
+        batch_values: list[Any] = list(sql_values)
+        for batch_entry in batch:
+            batch_values.extend(batch_entry)
+        conditions = [ sql_condition ] * len(batch)
+        batch_query = (sql +" WHERE "+ " OR ".join(conditions))
+        cursor = db.execute(batch_query, batch_values)
+        results.extend(return_type(*row) for row in cursor.fetchall())
+        cursor.close()
+        remaining_ids = remaining_ids[batch_size:]
+    return results
+
+
+# TODO(ideal) In an ideal world we would pass in a row factory and a return type, or use the typing
+#   stuff to use them. For instance, if fields in the return type are `IntFlag` structures they are
+#   not treated the same in their integer form as they would be if they were cast to the structure.
+def execute_sql_by_id(db: sqlite3.Connection, sql: str,
+        sql_values: list[Any], ids: Sequence[T2], return_type: Optional[Type[T1]]=None) \
+            -> tuple[int, list[T1]]:
+    """
+    Update, delete or whatever rows in batches as constrained by database limitations.
+
+    If the update statement returns values via `RETURNING`, specify a return type. However, it has
+    been observed that sometimes rows will be updated and returned, where `rowcount` is set to
+    zero. So it is better to check the count of the updates returned values, than rely on the
+    `rowcount` field.
+    """
+    batch_size = SQLITE_MAX_VARS - len(sql_values)
+    rows_updated = 0
+    remaining_ids = ids
+    rows: list[T1] = []
+    while len(remaining_ids):
+        batch_ids = remaining_ids[:batch_size]
+        sql = sql.format(",".join("?" for k in batch_ids))
+        # NOTE(typing) Cannot add a sequence to a list.
+        cursor = db.execute(sql, sql_values + batch_ids) # type: ignore
+        if return_type is not None:
+            rows.extend(return_type(*row) for row in cursor.fetchall())
+        rows_updated += cursor.rowcount
+        cursor.close()
+        remaining_ids = remaining_ids[batch_size:]
+    return rows_updated, rows
+
+
+def bulk_insert_returning(return_type: Type[T1], db: sqlite3.Connection, sql_prefix: str,
+        sql_suffix: str, insert_rows: Sequence[Collection[T2]]) -> list[T1]:
+    """
+    Do a bulk insert in a way where we get the primary key value back.
+
+    sql_prefix expected value `INSERT INTO MyTable (column1, column2) VALUES `
+    sql_suffix expected value `RETURNING key_column, column1, column2`
+
+    SQLite does not guarantee the order of the returned values, so it cannot be used to just
+    return the assigned primary key value for each given row. Instead the simplest approach is
+    to just return the whole row and give it back to the calling logic to use in place of the
+    source row data that went in.
+
+    It is the reponsibility of the caller to ensure the RETURNING column order provided in
+    `sql_suffix` matches the number of elements, and order, of the type to be returned
+    `return_type`.
+    """
+    row_size = len(insert_rows[0])
+    rows_per_batch = int(SQLITE_MAX_VARS // row_size)
+
+    value_parameter_text = "("+ ",".join(["?"] * row_size) +")"
+    next_row_index = 0
+    final_rows: list[T1] = []
+    while next_row_index < len(insert_rows):
+        batch_row_count = min(rows_per_batch, len(insert_rows)-next_row_index)
+        batch_values: list[Any] = []
+        values_text = ""
+        for i in range(next_row_index, next_row_index + batch_row_count):
+            if len(values_text):
+                values_text += ","
+            values_text += value_parameter_text
+            batch_values.extend(insert_rows[i])
+
+        sql_completed = f"{sql_prefix} {values_text} {sql_suffix}"
+        for inserted_row in db.execute(sql_completed, batch_values):
+            final_rows.append(return_type(*inserted_row))
+
+        next_row_index += batch_row_count
+    return final_rows
+
+
+def update_rows_by_ids(db: sqlite3.Connection, sql: str, sql_id_expression: str,
+        sql_values: list[Any], ids: Sequence[Collection[T1]],
+        sql_where_expression: Optional[str]=None) -> int:
+    """
+    Update rows in batches as constrained by database limitations.
+
+    This does not yet support `RETURNING`.
+    """
+    batch_size = min(SQLITE_MAX_VARS, SQLITE_EXPR_TREE_DEPTH) // 2 - len(sql_values)
+    rows_updated = 0
+    remaining_ids = ids
+    while len(remaining_ids):
+        batch_ids = remaining_ids[:batch_size]
+        batch_values: list[Any] = sql_values[:]
+        for batch_entry in batch_ids:
+            batch_values.extend(batch_entry)
+        id_sql_expressions = [ sql_id_expression ] * len(batch_ids)
+        sql_completed = sql +" WHERE "
+        sql_completed_id_expression = " OR ".join(id_sql_expressions)
+        if sql_where_expression:
+            sql_completed += f"{sql_where_expression} AND ({sql_completed_id_expression})"
+        else:
+            sql_completed += sql_completed_id_expression
+        cursor = db.execute(sql_completed, batch_values)
+        rows_updated += cursor.rowcount
+        cursor.close()
+        remaining_ids = remaining_ids[batch_size:]
+    return rows_updated
