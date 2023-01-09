@@ -1,0 +1,4 @@
+# 1.7
+
+* read_rows_by_ids: Added `where_condition` to allow the caller to specify static filter conditions
+  to the query being made.

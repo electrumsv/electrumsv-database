@@ -14,8 +14,8 @@ except ModuleNotFoundError:
     import sqlite3 # type: ignore[no-redef]
 import threading
 import time
-from typing import Any, cast, Callable, Collection, Concatenate, Optional, ParamSpec, Protocol, \
-    Sequence, Type, TypeVar
+from typing import Any, cast, Callable, Collection, Optional, ParamSpec, Protocol, Sequence, \
+    Type, TypeVar
 
 
 DATABASE_EXT = ".sqlite"
@@ -471,7 +471,8 @@ def read_rows_by_id(return_type: Type[T1], db: sqlite3.Connection, sql: str, par
 
 
 def read_rows_by_ids(return_type: Type[T1], db: sqlite3.Connection, sql: str, sql_condition: str,
-        sql_values: list[Any], ids: Sequence[Collection[T2]]) -> list[T1]:
+        sql_values: list[Any], ids: Sequence[Collection[T2]], where_condition: str|None=None) \
+            -> list[T1]:
     """
     Read rows in batches as constrained by database limitations.
     """
@@ -484,7 +485,10 @@ def read_rows_by_ids(return_type: Type[T1], db: sqlite3.Connection, sql: str, sq
         for batch_entry in batch:
             batch_values.extend(batch_entry)
         conditions = [ sql_condition ] * len(batch)
-        batch_query = (sql +" WHERE "+ " OR ".join(conditions))
+        if where_condition is not None:
+            batch_query = f"{sql} WHERE {where_condition} AND ({' OR '.join(conditions)})"
+        else:
+            batch_query = f"{sql} WHERE {' OR '.join(conditions)}"
         cursor = db.execute(batch_query, batch_values)
         results.extend(return_type(*row) for row in cursor.fetchall())
         cursor.close()
